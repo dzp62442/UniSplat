@@ -170,11 +170,9 @@ threadpoolctl==3.6.0
 tifffile==2025.3.30
 tomli==2.2.1
 tomlkit==0.13.2
-torch==2.6.0+cu124
-torch_cluster==1.6.3+pt26cu124
-torch_scatter==2.1.2+pt26cu124
+torch_cluster
+torch_scatter
 torchmetrics==1.7.2
-torchvision=0.21.0+cu124
 tornado==6.4.2
 tqdm==4.67.1
 traitlets==5.14.3

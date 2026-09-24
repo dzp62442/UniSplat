@@ -21,12 +21,16 @@ First, clone this repository and install the dependencies.
 ```bash
 git clone git@github.com:chenshi3/UniSplat.git
 cd UniSplat
-pip install -r requirements.txt
+
+conda create -n unisplat python=3.10 -y
+conda activate unisplat
+
+pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu118
+pip install -r requirements.txt --no-build-isolation
 
 ## install 3DGS rasterizer
-pip install -e submodules/diff-gaussian-rasterization-feature
-pip install -e submodules/simple-knn-v2
-
+pip install -e submodules/diff-gaussian-rasterization-feature --no-build-isolation
+pip install -e submodules/simple-knn-v2 --no-build-isolation
 ```
 
 Then download the pretrained model [weights](https://huggingface.co/chenchenshi/UniSplat/blob/main/model.safetensors) and example [data](https://huggingface.co/chenchenshi/UniSplat/blob/main/data.zip) from Hugging Face.
