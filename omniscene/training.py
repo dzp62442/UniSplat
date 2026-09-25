@@ -15,7 +15,7 @@ from .checkpoint import find_latest_checkpoint, save_checkpoint, load_training_s
 from .config import REPO_ROOT, config_identity, due_events, stage_for_step
 from .evaluate import make_loader, evaluate, validate, evaluation_identity, load_cached_evaluation
 from .io import to_device, write_json, restore_rng
-from .losses import ReconstructionLoss
+from .losses import ReconstructionLoss, lacks_scale_supervision
 from .model import StaticUniSplat, parameter_counts, local_path
 from .notify import FeishuNotifier
 from dataset.omniscene import OmniSceneDataset, sha256_file
@@ -69,6 +69,35 @@ def get_logger(directory):
 def require_cuda():
     if not torch.cuda.is_available():
         raise RuntimeError('CUDA is required for UniSplat sparse convolutions and rendering')
+
+
+def optimizer_update(model, criterion, optimizer, scaler, batch, stage, grad_max_norm):
+    """Attempt one update; numerical failures leave optimizer/step budgets intact."""
+    optimizer.zero_grad(set_to_none=True)
+    reconstruction, losses = None, {}
+    try:
+        reconstruction = model(batch['context'], stage=stage, supervision=batch['supervision'])
+        if lacks_scale_supervision(reconstruction, stage):
+            return reconstruction, losses, 'no_scale_supervision'
+        losses = criterion(model, reconstruction, batch['target'], stage)
+        total = sum(losses.values())
+        if not torch.isfinite(total):
+            return reconstruction, losses, 'nonfinite_loss'
+        scaler.scale(total).backward()
+        scaler.unscale_(optimizer)
+        norm = torch.nn.utils.clip_grad_norm_((p for p in model.parameters() if p.requires_grad), grad_max_norm)
+        if not torch.isfinite(norm):
+            scaler.update(new_scale=max(scaler.get_scale() / 2, torch.finfo(torch.float32).tiny))
+            optimizer.zero_grad(set_to_none=True)
+            return reconstruction, losses, 'nonfinite_gradient'
+    except FloatingPointError as error:
+        # This is a numerical computation failure, not a dataset-quality verdict.
+        # Other errors (e.g. CUDA OOM, bad interfaces) retain their real traceback.
+        optimizer.zero_grad(set_to_none=True)
+        return reconstruction, losses, f'{type(error).__name__}: {error}'
+    scaler.step(optimizer)
+    scaler.update()
+    return reconstruction, losses, None
 
 
 def run_training(cfg, resume=None, work_dir=None):
@@ -188,12 +217,15 @@ def run_training(cfg, resume=None, work_dir=None):
             completed_steps = max(step - start_step, 1)
             notification = dict(step=step, work_dir=str(directory), split='mini', results=str(result_dir),
                                 complete=summary['complete'], expected_bins=summary['expected_bins'],
+                                metrics_finite=summary.get('metrics_finite', True),
                                 all_18=summary['all_18'], novel_12=summary['novel_12'], timing=summary['timing'],
                                 eta_seconds=elapsed / completed_steps * (cfg.Train.max_steps - step))
             notifier.emit('mini_test_complete', step, f'UniSplat mini 评估：{cfg.Experiment.name} / {step}',
                           json.dumps(notification, ensure_ascii=False, indent=2))
             if not summary['complete']:
                 raise RuntimeError(f'Incomplete mini evaluation at {step}; inspect {result_dir}')
+            if not summary.get('metrics_finite', True):
+                logger.warning('Mini evaluation at %d covered all bins; some metrics are undefined. See %s', step, result_dir)
             progress['last_mini_test_step'] = step
             save_events()
 
@@ -227,26 +259,26 @@ def run_training(cfg, resume=None, work_dir=None):
                 continue
             progress['offset'] += 1
             model.train()
-            optimizer.zero_grad(set_to_none=True)
             batch = to_device(batch, 'cuda')
-            reconstruction = model(batch['context'], stage=stage, supervision=batch['supervision'])
-            losses = criterion(model, reconstruction, batch['target'], stage)
-            total = sum(losses.values())
-            if not torch.isfinite(total):
-                raise FloatingPointError(f'Nonfinite loss at step {progress["global_step"]}: {batch["meta"]["bin_token"]}')
-            scaler.scale(total).backward()
-            scaler.unscale_(optimizer)
-            norm = torch.nn.utils.clip_grad_norm_((p for p in model.parameters() if p.requires_grad), cfg.Train.grad_max_norm)
-            if not torch.isfinite(norm):
-                scaler.update(new_scale=scaler.get_scale() / 2)
+            reconstruction, losses, skip_reason = optimizer_update(
+                model, criterion, optimizer, scaler, batch, stage, cfg.Train.grad_max_norm)
+            alignment = reconstruction.get('alignment') if reconstruction is not None else None
+            if stage == 2 and alignment is not None and not alignment[2].all():
+                event = dict(step=progress['global_step'], bin_token=batch['meta']['bin_token'][0],
+                             fitted_cameras=int(alignment[2].sum()), fallback_cameras=int((~alignment[2]).sum()))
+                logger.warning('Scale teacher unavailable for some cameras; using frozen predictions: %s', event)
+                with (directory / 'alignment_fallbacks.jsonl').open('a') as f:
+                    f.write(json.dumps(event) + '\n')
+            if skip_reason is not None:
                 skipped += 1
-                logger.warning('Skipped nonfinite gradient update (%d); optimizer step budget unchanged', skipped)
-                if skipped >= cfg.Train.max_consecutive_skipped_updates:
-                    raise FloatingPointError('Too many consecutive invalid updates')
-                del total, losses, reconstruction, batch
+                event = dict(step=progress['global_step'], stage=stage, epoch=progress['epoch'],
+                             offset=progress['offset'], bin_token=batch['meta']['bin_token'][0],
+                             reason=skip_reason, consecutive_skips=skipped)
+                logger.warning('Skipped optimizer update; budget/scheduler unchanged: %s', event)
+                with (directory / 'skipped_updates.jsonl').open('a') as f:
+                    f.write(json.dumps(event) + '\n')
+                del losses, reconstruction, batch
                 continue
-            scaler.step(optimizer)
-            scaler.update()
             skipped = 0
             scheduler.step()
             progress['global_step'] += 1
@@ -260,7 +292,7 @@ def run_training(cfg, resume=None, work_dir=None):
                             metrics, [g['lr'] for g in optimizer.param_groups])
                 with (directory / 'train.jsonl').open('a') as f:
                     f.write(json.dumps(dict(step=step, stage=stage, losses=metrics)) + '\n')
-            del total, losses, reconstruction, batch
+            del losses, reconstruction, batch
             val_due, mini_due = due_events(step, cfg)
             if val_due or mini_due or step in stage_ends:
                 checkpoint = save_checkpoint(directory / 'checkpoints', model, optimizer, scheduler, scaler,

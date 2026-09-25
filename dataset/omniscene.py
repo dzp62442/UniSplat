@@ -5,6 +5,7 @@ sky masks, Metric3D confidence or extra offline assets are accessed.
 """
 import hashlib
 import json
+import logging
 import pickle
 from pathlib import Path
 
@@ -26,16 +27,14 @@ def sha256_file(path):
 
 
 def relative_depth_from_disparity(disp):
-    """Identical finite-input conversion to SVF-GS / DepthSplat, NaN if degenerate."""
+    """Use the reference loaders' conversion without judging disparity values."""
     disp = np.asarray(disp, dtype=np.float32)
-    if not np.isfinite(disp).all() or disp.min() < 0 or disp.max() <= disp.min():
-        return np.full_like(disp, np.nan)
-    ratio = min(disp.max() / (disp.min() + 0.001), 50.0)
-    depth = 1.0 / np.maximum(disp, disp.max() / ratio)
-    span = depth.max() - depth.min()
-    if not np.isfinite(span) or span <= 0:
-        return np.full_like(disp, np.nan)
-    return (depth - depth.min()) / span
+    # Zero variance may yield NaN. Preserve it as an undefined PCC, without
+    # rejecting the bin or replacing its reference depth with fabricated values.
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ratio = min(disp.max() / (disp.min() + 0.001), 50.0)
+        depth = 1.0 / np.maximum(disp, disp.max() / ratio)
+        return (depth - depth.min()) / (depth.max() - depth.min())
 
 
 def asset_path(data_path, root, source_prefix, role):
@@ -72,8 +71,11 @@ class OmniSceneDataset(Dataset):
         name = 'train' if split == 'train' else 'val'
         self.manifest = self.root / cfg.version / f'bins_{name}_3.2m.json'
         bins = json.loads(self.manifest.read_text())['bins']
-        if len(bins) != len(set(bins)) or not bins:
-            raise ValueError(f'Nonunique or empty manifest: {self.manifest}')
+        if not bins:
+            raise ValueError(f'No samples to load: {self.manifest}')
+        if len(bins) != len(set(bins)):
+            logging.getLogger('unisplat.omniscene').warning(
+                'Repeated tokens in %s; preserving manifest order and sampling multiplicity', self.manifest)
         self.bin_tokens = bins[:30000:3000][:10] if split == 'val' else bins
         if split == 'mini':
             self.bin_tokens = bins[0::14][:2048]
@@ -101,15 +103,15 @@ class OmniSceneDataset(Dataset):
                               [0, k[1, 1] * scale_h, k[1, 2] * scale_h], [0, 0, 1]])
             rgb = torch.from_numpy(np.array(source)).permute(2, 0, 1).float() / 255
         pose = torch.as_tensor(np.array(info['sensor2lidar_transform']), dtype=torch.float32)
-        if pose.shape != (4, 4) or not torch.isfinite(pose).all():
-            raise ValueError(f'Invalid camera pose: {info["data_path"]}')
+        if pose.shape != (4, 4):
+            raise ValueError(f'Expected a 4x4 camera pose: {info["data_path"]}')
         view = dict(image=rgb, intrinsics=torch.as_tensor(k, dtype=torch.float32), extrinsics=pose)
         if self.load_loss_mask:
             mask = np.ones(self.shape, dtype=np.float32)
             if novel:
                 with Image.open(self.path(info, 'mask')) as source:
                     source = source.convert('L')
-                    if resized:
+                    if source.size != (w, h):
                         source = source.resize((w, h), Image.Resampling.BILINEAR)
                     mask = np.array(source).astype(np.float32) / 255
             if mask.shape != self.shape:
@@ -119,7 +121,7 @@ class OmniSceneDataset(Dataset):
             if not enabled:
                 continue
             array = np.load(self.path(info, role), allow_pickle=False).astype(np.float32)
-            if resized:
+            if array.shape != self.shape:
                 array = np.array(Image.fromarray(array).resize((w, h), Image.Resampling.BILINEAR))
             if array.shape != self.shape:
                 raise ValueError(f'{role} depth and RGB shape mismatch')

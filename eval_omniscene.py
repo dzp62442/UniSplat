@@ -41,7 +41,7 @@ def main():
     output = (Path(args.output_dir) if args.output_dir else
               REPO_ROOT / 'outputs' / cfg.Experiment.name / f'step_{step:06d}_{digest[:8]}' / args.split)
     summary = evaluate(model, cfg, output, dict(path=str(checkpoint), sha256=digest, global_step=step), args.split)
-    print(json.dumps({k: summary[k] for k in ('complete', 'expected_bins', 'all_18', 'novel_12', 'timing')}, indent=2))
+    print(json.dumps({k: summary[k] for k in ('complete', 'metrics_finite', 'expected_bins', 'all_18', 'novel_12', 'timing')}, indent=2))
     if not summary['complete']:
         raise RuntimeError(f'Incomplete evaluation: {output}')
 

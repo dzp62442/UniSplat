@@ -1,6 +1,7 @@
 """One reconstruction per bin, full target rendering, metrics and timings."""
 import csv
 import json
+import logging
 import platform
 import time
 from pathlib import Path
@@ -10,7 +11,8 @@ from torch.utils.data import DataLoader
 
 from .config import config_identity
 from .io import capture_rng, restore_rng, isolated_evaluation, to_device, write_json
-from .metrics import ImageMetrics, view_records, summarize_records, summarize_times
+from .metrics import ImageMetrics, METRICS, VIEW_GROUPS, view_records, summarize_records, summarize_times
+from .losses import lacks_scale_supervision
 from .model import local_path, parameter_counts
 from dataset.omniscene import OmniSceneDataset, sha256_file
 
@@ -66,6 +68,7 @@ def load_cached_evaluation(output_dir, identity, expected_tokens):
 
 
 def evaluate(model, cfg, output_dir, checkpoint, split='mini', metrics=None, logger=None):
+    logger = logger or logging.getLogger('unisplat.omniscene')
     dataset = OmniSceneDataset(cfg.Dataset, split, stage=3)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -83,49 +86,66 @@ def evaluate(model, cfg, output_dir, checkpoint, split='mini', metrics=None, log
             metrics = ImageMetrics(local_path(cfg.Loss.vgg_ckpt), local_path(cfg.Loss.lpips_ckpt), device)
         finally:
             restore_rng(rng)
-    rows, timing_rows = [], []
+    rows, timing_rows, numerical_failures = [], [], []
     error_text = None
     write_json(output_dir / 'model_parameters.json', parameter_counts(model))
     fields = ['bin_token', 'scene_id', 'view_group', 'height', 'width', 'psnr', 'ssim', 'lpips', 'pcc',
-              'split', 'global_step', 'checkpoint_sha256']
+              'pcc_status', 'numerical_error', 'split', 'global_step', 'checkpoint_sha256']
     try:
         with isolated_evaluation(model), (output_dir / 'per_bin_metrics.csv').open('w', newline='') as stream:
             writer = csv.DictWriter(stream, fieldnames=fields)
             writer.writeheader()
             loader = make_loader(dataset, cfg)
-            warmup = next(iter(loader))
-            warm_context = to_device(warmup['context'], device)
-            for _ in range(cfg.Evaluation.warmup_steps):
-                warm_result = model.reconstruct(warm_context, stage=3)
-                del warm_result
-            del warm_context, warmup
-            torch.cuda.synchronize(device)
+            warmed_up = cfg.Evaluation.warmup_steps == 0
             for index, batch in enumerate(loader):
-                torch.cuda.synchronize(device)
-                begin = time.perf_counter()
-                context = to_device(batch['context'], device)
-                torch.cuda.synchronize(device)
-                after_transfer = time.perf_counter()
-                reconstruction = model.reconstruct(context, stage=3)
-                torch.cuda.synchronize(device)
-                finished = time.perf_counter()
                 token = batch['meta']['bin_token'][0]
-                timing_rows.append(dict(bin_token=token, reconstruction_ms=(finished - begin) * 1000,
-                                        network_reconstruction_ms=(finished - after_transfer) * 1000,
-                                        h2d_ms=(after_transfer - begin) * 1000))
-                target = to_device(batch['target'], device)
-                rendered = model.render(reconstruction['gaussians'],
-                                        {k: target[k] for k in ('intrinsics', 'extrinsics')}, cfg.Dataset.image_shape)
-                scores = metrics(target['image'][0], rendered['image'])
-                records = view_records(token, batch['meta']['scene_id'][0], scores,
-                                       target['rel_depth'][0], rendered['depth'][:, 0], cfg.Dataset.image_shape)
+                timing = dict(bin_token=token, reconstruction_ms=None, network_reconstruction_ms=None, h2d_ms=None)
+                reconstruction = rendered = scores = target = context = None
+                try:
+                    if not warmed_up:
+                        warm_context = to_device(batch['context'], device)
+                        try:
+                            for _ in range(cfg.Evaluation.warmup_steps):
+                                warm_result = model.reconstruct(warm_context, stage=3)
+                                del warm_result
+                        finally:
+                            del warm_context
+                        warmed_up = True
+                    torch.cuda.synchronize(device)
+                    begin = time.perf_counter()
+                    context = to_device(batch['context'], device)
+                    torch.cuda.synchronize(device)
+                    after_transfer = time.perf_counter()
+                    reconstruction = model.reconstruct(context, stage=3)
+                    torch.cuda.synchronize(device)
+                    finished = time.perf_counter()
+                    timing.update(reconstruction_ms=(finished - begin) * 1000,
+                                  network_reconstruction_ms=(finished - after_transfer) * 1000,
+                                  h2d_ms=(after_transfer - begin) * 1000)
+                    target = to_device(batch['target'], device)
+                    rendered = model.render(reconstruction['gaussians'],
+                                            {k: target[k] for k in ('intrinsics', 'extrinsics')}, cfg.Dataset.image_shape)
+                    scores = metrics(target['image'][0], rendered['image'])
+                    records = view_records(token, batch['meta']['scene_id'][0], scores,
+                                           target['rel_depth'][0], rendered['depth'][:, 0], cfg.Dataset.image_shape)
+                except FloatingPointError as error:
+                    reason = f'{type(error).__name__}: {error}'
+                    numerical_failures.append(dict(bin_token=token, reason=reason))
+                    logger.warning('Evaluation computation unavailable for %s; continuing: %s', token, reason)
+                    timing['numerical_error'] = reason
+                    rendered = None
+                    records = [dict(bin_token=token, scene_id=batch['meta']['scene_id'][0], view_group=g,
+                                    height=cfg.Dataset.image_shape[0], width=cfg.Dataset.image_shape[1],
+                                    **{m: float('nan') for m in METRICS}, pcc_status='computation_unavailable',
+                                    numerical_error=reason) for g in VIEW_GROUPS]
+                timing_rows.append(timing)
                 for row in records:
                     row.update(split=split, global_step=checkpoint['global_step'],
                                checkpoint_sha256=checkpoint['sha256'])
                 rows.extend(records)
                 writer.writerows(records)
                 stream.flush()
-                if cfg.Evaluation.save_images:
+                if cfg.Evaluation.save_images and rendered is not None:
                     from PIL import Image
                     directory = output_dir / 'images' / token
                     directory.mkdir(parents=True, exist_ok=True)
@@ -140,7 +160,8 @@ def evaluate(model, cfg, output_dir, checkpoint, split='mini', metrics=None, log
         raise
     finally:
         summary = summarize_records(rows, dataset.bin_tokens)
-        summary.update(checkpoint=checkpoint, split=split, image_shape=list(cfg.Dataset.image_shape), error=error_text)
+        summary.update(checkpoint=checkpoint, split=split, image_shape=list(cfg.Dataset.image_shape), error=error_text,
+                       numerical_failures=numerical_failures)
         if error_text is not None:
             summary['complete'] = False
         timing_summary = summarize_times(timing_rows)
@@ -153,22 +174,42 @@ def evaluate(model, cfg, output_dir, checkpoint, split='mini', metrics=None, log
         summary['timing'] = {k: v for k, v in timing_summary.items() if k != 'per_bin'}
         write_json(output_dir / 'reconstruction_time.json', timing_summary)
         write_json(summary_file, summary)
+        if not summary['metrics_finite']:
+            logger.warning('Evaluation %s has undefined metrics; retained all records and finite counts in %s',
+                           split, summary_file)
     return summary
 
 
 def validate(model, cfg, criterion, logger=None):
+    logger = logger or logging.getLogger('unisplat.omniscene')
     dataset = OmniSceneDataset(cfg.Dataset, 'val', stage=model.stage)
     device = next(model.parameters()).device
-    totals = {}
+    totals, skipped_bins, used_bins = {}, [], 0
     with isolated_evaluation(model):
         for batch in make_loader(dataset, cfg):
             context, target = to_device(batch['context'], device), to_device(batch['target'], device)
             supervision = to_device(batch['supervision'], device)
-            reconstruction = model(context, stage=model.stage, supervision=supervision)
-            losses = criterion(model, reconstruction, target, model.stage)
+            reason = None
+            try:
+                reconstruction = model(context, stage=model.stage, supervision=supervision)
+                if lacks_scale_supervision(reconstruction, model.stage):
+                    reason = 'no_scale_supervision'
+                else:
+                    losses = criterion(model, reconstruction, target, model.stage)
+                    if any(not torch.isfinite(value) for value in losses.values()):
+                        reason = 'nonfinite_loss'
+            except FloatingPointError as error:
+                reason = f'{type(error).__name__}: {error}'
+            if reason is not None:
+                event = dict(bin_token=batch['meta']['bin_token'][0], reason=reason)
+                skipped_bins.append(event)
+                logger.warning('Validation loss unavailable; continuing: %s', event)
+                continue
+            used_bins += 1
             for key, value in losses.items():
-                totals[key] = totals.get(key, 0.0) + value.item() / len(dataset)
-    output = dict(stage=model.stage, num_bins=len(dataset), losses=totals,
+                totals[key] = totals.get(key, 0.0) + value.item()
+    output = dict(stage=model.stage, num_bins=len(dataset), used_bins=used_bins, skipped_bins=skipped_bins,
+                  losses={k: v / used_bins for k, v in totals.items()},
                   geometry='metric3d_aligned' if model.stage in (1, 2) else 'predicted_scale_shift')
     if logger:
         logger.info('Validation: %s', output)

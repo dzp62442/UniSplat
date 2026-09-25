@@ -8,6 +8,11 @@ def masked_rgb_mse(predicted, target, mask):
     return ((predicted * mask[:, None] - target * mask[:, None]) ** 2).mean()
 
 
+def lacks_scale_supervision(reconstruction, stage):
+    alignment = reconstruction.get('alignment')
+    return stage == 1 and alignment is not None and not bool(alignment[2].any())
+
+
 class ReconstructionLoss(nn.Module):
     def __init__(self, cfg, perceptual=None):
         super().__init__()
@@ -23,11 +28,12 @@ class ReconstructionLoss(nn.Module):
     def forward(self, model, reconstruction, target, stage):
         if stage == 1:
             scale, shift, valid = reconstruction['alignment']
-            if not valid.any():
-                raise ValueError('No valid depth alignments')
+            # Empty selections sum to differentiable zero; the training loop
+            # skips the optimizer/scheduler rather than counting a zero-loss step.
+            count = valid.sum().clamp_min(1)
             losses = {
-                'scale': (reconstruction['pred_scale'][valid] - scale[valid]).abs().mean() * self.cfg.scale_weight,
-                'shift': (reconstruction['pred_shift'][valid] - shift[valid]).abs().mean() * self.cfg.shift_weight,
+                'scale': (reconstruction['pred_scale'][valid] - scale[valid]).abs().sum() / count * self.cfg.scale_weight,
+                'shift': (reconstruction['pred_shift'][valid] - shift[valid]).abs().sum() / count * self.cfg.shift_weight,
             }
             return losses
         cameras = {key: target[key] for key in ('intrinsics', 'extrinsics')}

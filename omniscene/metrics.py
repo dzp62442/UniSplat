@@ -57,35 +57,51 @@ def view_records(token, scene, image_metrics, reference, predicted, image_shape)
         row = dict(bin_token=token, scene_id=scene, view_group=group, height=image_shape[0], width=image_shape[1])
         row.update({name: value[indices].double().mean().item() for name, value in image_metrics.items()})
         row['pcc'] = compute_pcc(reference[indices], predicted[indices]).item()
+        row['pcc_status'] = ('ok' if math.isfinite(row['pcc']) else
+                             'nonfinite_reference' if not torch.isfinite(reference[indices]).all() else
+                             'nonfinite_rendered_depth' if not torch.isfinite(predicted[indices]).all() else
+                             'zero_variance_or_insufficient_pixels')
         rows.append(row)
     return rows
 
 
 def summarize_records(records, expected_tokens):
-    expected = set(expected_tokens)
-    if not expected or len(expected) != len(expected_tokens):
-        raise ValueError('Expected a nonempty unique token list')
+    expected_counts = Counter(expected_tokens)
+    expected = set(expected_counts)
+    if not expected:
+        raise ValueError('No evaluation samples in the manifest')
     if any(r['view_group'] not in VIEW_GROUPS for r in records):
         raise ValueError('Unknown metric group')
-    summary = dict(expected_bins=len(expected), complete=True, primary_groups=['all_18', 'novel_12'],
+    summary = dict(expected_bins=len(expected_tokens), complete=True, metrics_finite=True,
+                   manifest_repeated_tokens={k: n for k, n in expected_counts.items() if n > 1},
+                   primary_groups=['all_18', 'novel_12'],
                    pcc_reference='depth_anything_v2', depth_semantics='accumulated_z', pixel_protocol='full_image',
                    aggregation='Mean per-view RGB within bin, then equal-bin mean; PCC flattened per bin/group')
     for group in VIEW_GROUPS:
         rows = [r for r in records if r['view_group'] == group]
         counts = Counter(r['bin_token'] for r in rows)
-        invalid = [dict(bin_token=r['bin_token'], metric=m) for r in rows for m in METRICS
+        invalid = [dict(bin_token=r['bin_token'], metric=m,
+                        reason=r.get(m + '_status') or r.get('numerical_error') or 'nonfinite_metric')
+                   for r in rows for m in METRICS
                    if r.get(m) is None or not math.isfinite(r[m])]
-        missing, extra = sorted(expected - counts.keys()), sorted(counts.keys() - expected)
-        duplicates = sorted(k for k, n in counts.items() if n != 1)
-        complete = not (missing or extra or duplicates or invalid)
-        output = dict(num_bins=len(counts), num_records=len(rows), complete=complete,
+        missing = sorted(k for k, n in expected_counts.items() if counts[k] < n)
+        extra = sorted(counts.keys() - expected)
+        duplicates = sorted(k for k, n in counts.items() if n > expected_counts.get(k, 1))
+        # Coverage and mathematical metric availability are separate. An
+        # undefined PCC does not mean the bin was not reconstructed/evaluated.
+        complete = not (missing or extra or duplicates)
+        output = dict(num_bins=len(rows), num_unique_bins=len(counts), num_records=len(rows), complete=complete,
+                      metrics_finite=not invalid,
                       missing_bins=missing, unexpected_bins=extra, duplicate_bins=duplicates, nonfinite_metrics=invalid)
+        output['finite_metric_counts'] = {}
         for name in METRICS:
             values = [r.get(name) for r in rows]
+            output['finite_metric_counts'][name] = sum(v is not None and math.isfinite(v) for v in values)
             output[name] = (math.fsum(values) / len(values)
                             if values and all(v is not None and math.isfinite(v) for v in values) else None)
         summary[group] = output
         summary['complete'] &= complete
+        summary['metrics_finite'] &= not invalid
     return summary
 
 
@@ -94,7 +110,8 @@ def summarize_times(rows):
                    reconstruction_boundary='Input H2D through final merged Gaussians; excludes target rendering/metrics/IO',
                    network_boundary='GPU-resident inputs through final merged Gaussians; includes CPU control work')
     for key in ('reconstruction_ms', 'network_reconstruction_ms', 'h2d_ms'):
-        values = [r[key] for r in rows]
+        values = [r[key] for r in rows if r.get(key) is not None and math.isfinite(r[key])]
         summary[key] = (dict(mean=float(np.mean(values)), median=float(np.median(values)),
                              p95=float(np.percentile(values, 95))) if values else None)
+        summary[key + '_num_bins'] = len(values)
     return summary

@@ -73,6 +73,8 @@ class StaticUniSplat(nn.Module):
         images = context['image']
         if images.shape[:3] != (1, 6, 3):
             raise ValueError(f'Expected [1,6,3,H,W], got {tuple(images.shape)}')
+        if any(not torch.isfinite(context[k]).all() for k in ('intrinsics', 'extrinsics')):
+            raise FloatingPointError('Camera projection requires finite input matrices')
         padded = pad_images(images)
         if not torch.cuda.is_bf16_supported():
             raise RuntimeError('The reviewed Pi3 precision requires a GPU with BF16 support')
@@ -89,6 +91,8 @@ class StaticUniSplat(nn.Module):
         if set(cameras) != {'intrinsics', 'extrinsics'}:
             raise ValueError('Renderer accepts only target cameras')
         k, poses = cameras['intrinsics'][0], cameras['extrinsics'][0]
+        if not torch.isfinite(k).all() or not torch.isfinite(poses).all():
+            raise FloatingPointError('Rendering requires finite target camera matrices')
         h, w = image_shape
         views = len(k)
         if self.gaussian_head.renderer.resolution != [h, w]:

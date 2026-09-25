@@ -120,8 +120,8 @@ class StaticGaussianHead(GuassianHead):
         valid = usable & torch.isfinite(scale) & torch.isfinite(shift) & (scale > 0)
         scale = torch.where(valid, scale, 0)
         shift = torch.where(valid, shift, 0)
-        if not valid.any():
-            raise ValueError('All six Metric3D alignments are invalid; refusing a zero-loss training update')
+        # Lack of a fitted teacher is a per-camera supervision state. Stage 1
+        # skips an unsupervised update; stage 2 already falls back to predictions.
         return scale.reshape(b, s), shift.reshape(b, s), valid.reshape(b, s)
 
     def scaffold(self, means, rgb, image_features, context, padded_shape):

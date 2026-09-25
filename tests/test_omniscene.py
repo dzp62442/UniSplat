@@ -20,10 +20,10 @@ from dataset.omniscene import CAMERAS, OmniSceneDataset, relative_depth_from_dis
 from omniscene.config import REPO_ROOT, load_config, due_events, stage_for_step, config_identity
 from omniscene.geometry import pad_images, camera_rays, matching_voxel_features
 from omniscene.io import isolated_evaluation, write_json
-from omniscene.losses import masked_rgb_mse
+from omniscene.losses import ReconstructionLoss, masked_rgb_mse
 from omniscene.metrics import compute_pcc, view_records, summarize_records
 from omniscene.model import StaticUniSplat
-from omniscene.training import build_optimizer, ResumeSampler
+from omniscene.training import build_optimizer, optimizer_update, ResumeSampler
 from omniscene.checkpoint import find_latest_checkpoint, save_checkpoint, load_training_state, restore_checkpoint
 from omniscene.notify import FeishuNotifier, send_one
 
@@ -137,6 +137,39 @@ class DatasetTests(unittest.TestCase):
         expected = (expected - expected.min()) / (expected.max() - expected.min())
         np.testing.assert_allclose(relative_depth_from_disparity(disparity), expected)
 
+    def test_negative_disparity_uses_reference_conversion(self):
+        disparity = np.array([[-.5, 1.], [2., 3.]], np.float32)
+        ratio = min(disparity.max() / (disparity.min() + .001), 50.)
+        expected = 1. / np.maximum(disparity, disparity.max() / ratio)
+        expected = (expected - expected.min()) / (expected.max() - expected.min())
+        np.testing.assert_allclose(relative_depth_from_disparity(disparity), expected)
+
+    def test_assets_resize_independently_of_rgb(self):
+        cfg = OmegaConf.create(OmegaConf.to_container(self.cfg.Dataset))
+        cfg.image_shape = [224, 400]  # RGB already has the target dimensions.
+        mask_path = self.root / 'samples_mask_small' / f'{CAMERAS[0]}_1.png'
+        original = mask_path.read_bytes()
+        try:
+            Image.fromarray(np.full((112, 200), 128, np.uint8)).save(mask_path)
+            with patch('dataset.omniscene.np.load', return_value=np.ones((112, 200), np.float32)):
+                sample = OmniSceneDataset(cfg, 'train', 2)[0]
+                self.assertEqual(sample['supervision']['input_metric_depth'].shape, (6, 224, 400))
+                self.assertEqual(sample['target']['loss_mask'].shape, (18, 224, 400))
+                self.assertEqual(sample['context']['intrinsics'][0, 0, 0], 210)
+        finally:
+            mask_path.write_bytes(original)
+
+    def test_repeated_manifest_entries_preserve_sampling(self):
+        manifest = self.root / self.cfg.Dataset.version / 'bins_val_3.2m.json'
+        original = manifest.read_bytes()
+        try:
+            manifest.write_text(json.dumps({'bins': self.tokens + self.tokens[:1]}))
+            with self.assertLogs('unisplat.omniscene', level='WARNING'):
+                data = OmniSceneDataset(self.cfg.Dataset, 'total')
+            self.assertEqual(data.bin_tokens, self.tokens + self.tokens[:1])
+        finally:
+            manifest.write_bytes(original)
+
 
 class GeometryTests(unittest.TestCase):
     def test_padding_preserves_pixels_and_rays(self):
@@ -188,7 +221,35 @@ class MetricTests(unittest.TestCase):
         self.assertFalse(summarize_records(rows + rows, ['bin'])['complete'])
         self.assertFalse(summarize_records(rows, ['bin', 'missing'])['complete'])
         rows[0]['pcc'] = float('nan')
-        self.assertFalse(summarize_records(rows, ['bin'])['complete'])
+        summary = summarize_records(rows, ['bin'])
+        self.assertTrue(summary['complete'])
+        self.assertFalse(summary['metrics_finite'])
+        self.assertIsNone(summary['all_18']['pcc'])
+        self.assertEqual(summary['all_18']['finite_metric_counts']['pcc'], 0)
+        self.assertEqual(summary['novel_12']['finite_metric_counts']['pcc'], 1)
+        self.assertEqual(summary['all_18']['psnr'], 8.5)
+
+    def test_repeated_expected_tokens_count_as_manifest_entries(self):
+        scores = {k: torch.ones(18) for k in ('psnr', 'ssim', 'lpips')}
+        depth = torch.arange(18 * 12, dtype=torch.float32).reshape(18, 3, 4)
+        rows = view_records('bin', 'scene', scores, depth, depth, (3, 4))
+        summary = summarize_records(rows + rows, ['bin', 'bin'])
+        self.assertTrue(summary['complete'])
+        self.assertEqual(summary['expected_bins'], 2)
+        self.assertEqual(summary['all_18']['num_records'], 2)
+        self.assertFalse(summarize_records(rows, ['bin', 'bin'])['complete'])
+
+    def test_undefined_pcc_has_reason_without_losing_rgb_scores(self):
+        scores = {k: torch.ones(18) for k in ('psnr', 'ssim', 'lpips')}
+        depth = torch.arange(18 * 12, dtype=torch.float32).reshape(18, 3, 4)
+        for reference, reason in [(torch.ones_like(depth), 'zero_variance_or_insufficient_pixels'),
+                                  (torch.full_like(depth, float('nan')), 'nonfinite_reference')]:
+            rows = view_records('bin', 'scene', scores, reference, depth, (3, 4))
+            self.assertEqual(rows[0]['pcc_status'], reason)
+            summary = summarize_records(rows, ['bin'])
+            self.assertTrue(summary['complete'])
+            self.assertEqual(summary['all_18']['ssim'], 1.)
+            self.assertEqual(summary['all_18']['nonfinite_metrics'][0]['reason'], reason)
 
 
 class TinyModel(StaticUniSplat):
@@ -259,6 +320,61 @@ class CheckpointDiscoveryTests(unittest.TestCase):
 
 
 class TrainingTests(unittest.TestCase):
+    def test_empty_alignment_and_loss_do_not_raise(self):
+        from model.gaussian_head.static_head import StaticGaussianHead
+        cfg = load_config('configs/experiment/omniscene_112x200.yaml')
+        depth = torch.ones(1, 6, 14, 14)
+        intrinsics = torch.tensor([[10., 0, 7], [0, 10., 7], [0, 0, 1]])[None, None].repeat(1, 6, 1, 1)
+        head = SimpleNamespace(cfg=cfg.Model.Gaussian_head)
+        for unavailable in (torch.zeros_like(depth), torch.full_like(depth, float('nan'))):
+            alignment = StaticGaussianHead.align_depth(head, depth, unavailable, intrinsics)
+            self.assertFalse(alignment[2].any())
+            rec = dict(alignment=alignment, pred_scale=torch.ones(1, 6, requires_grad=True),
+                       pred_shift=torch.ones(1, 6, requires_grad=True))
+            loss = sum(ReconstructionLoss(cfg, nn.Identity())(None, rec, {}, 1).values())
+            self.assertEqual(loss.item(), 0)
+            loss.backward()
+            torch.testing.assert_close(rec['pred_scale'].grad, torch.zeros(1, 6))
+
+    def test_numerical_skips_leave_optimizer_intact_and_allow_next_update(self):
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.p = nn.Parameter(torch.tensor(2.))
+                self.mode = 'healthy'
+                self.p.register_hook(lambda g: g * float('nan') if self.mode == 'gradient' else g)
+            def forward(self, context, stage, supervision):
+                if self.mode == 'geometry':
+                    raise FloatingPointError('nonfinite model geometry')
+                if self.mode == 'interface':
+                    raise ValueError('fixture programming error')
+                result = dict(loss=self.p.square())
+                if self.mode == 'loss':
+                    result['loss'] *= float('nan')
+                if self.mode == 'supervision':
+                    result['alignment'] = (None, None, torch.zeros(1, 6, dtype=torch.bool))
+                return result
+        model = Model()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=.1)
+        scaler = torch.amp.GradScaler('cpu')
+        criterion = lambda m, r, t, s: {'rec': r['loss']}
+        batch = dict(context={}, target={}, supervision={})
+        for mode in ('supervision', 'loss', 'gradient', 'geometry'):
+            model.mode = mode
+            for _ in range(12):
+                _, _, reason = optimizer_update(model, criterion, optimizer, scaler, batch, 1, 10.)
+                self.assertIsNotNone(reason)
+                self.assertEqual(model.p.item(), 2.)
+                self.assertEqual(len(optimizer.state), 0)
+        model.mode = 'healthy'
+        _, _, reason = optimizer_update(model, criterion, optimizer, scaler, batch, 1, 10.)
+        self.assertIsNone(reason)
+        self.assertEqual(optimizer.state[model.p]['step'], 1)
+        self.assertLess(model.p.item(), 2.)
+        model.mode = 'interface'
+        with self.assertRaisesRegex(ValueError, 'programming error'):
+            optimizer_update(model, criterion, optimizer, scaler, batch, 1, 10.)
+
     def test_stage_transition_reenables_parameters(self):
         cfg = load_config('configs/experiment/omniscene_112x200.yaml')
         model = TinyModel()
@@ -325,12 +441,15 @@ class TrainingTests(unittest.TestCase):
         """Run the real loop with tiny CPU stand-ins and interrupt the final mini."""
         self.exercise_auto_resume()
 
+    def test_training_and_resume_accept_undefined_pcc(self):
+        self.exercise_auto_resume(undefined_pcc=True)
+
     def test_training_auto_resume_across_stage_boundaries(self):
         for step in (2, 3, 5):
             with self.subTest(interrupted_checkpoint=step):
                 self.exercise_auto_resume(interrupted_checkpoint=step)
 
-    def exercise_auto_resume(self, interrupted_checkpoint=None):
+    def exercise_auto_resume(self, interrupted_checkpoint=None, undefined_pcc=False):
         from omniscene import training
         cfg = load_config('configs/experiment/omniscene_112x200.yaml')
         cfg.Train.stage_steps, cfg.Train.max_steps = [2, 3, 2], 7
@@ -374,7 +493,8 @@ class TrainingTests(unittest.TestCase):
             if interrupted_checkpoint is None and step == 7 and evaluations.count(7) == 1:
                 raise RuntimeError('injected final evaluation interruption')
             rows = [dict(bin_token='0', scene_id='scene', view_group=g, height=112, width=200,
-                         psnr=20., ssim=.5, lpips=.4, pcc=.3, global_step=step, checkpoint_sha256=identity['sha256'])
+                         psnr=20., ssim=.5, lpips=.4, pcc=float('nan') if undefined_pcc else .3,
+                         global_step=step, checkpoint_sha256=identity['sha256'])
                     for g in ('all_18', 'novel_12', 'input_6')]
             result = dict(summarize_records(rows, ['0']), timing={})
             write_json(Path(output) / 'data_provenance.json',
@@ -487,6 +607,78 @@ class NotificationTests(unittest.TestCase):
 
 
 class EvaluationCacheTests(unittest.TestCase):
+    def test_numerical_failures_and_undefined_pcc_continue_and_cache(self):
+        from omniscene import evaluate as module
+        cfg = load_config('configs/experiment/omniscene_112x200.yaml')
+        cfg.Dataset.num_workers, cfg.Evaluation.warmup_steps = 0, 2
+        depth = torch.arange(18 * 12, dtype=torch.float32).reshape(18, 3, 4)
+        class Data(torch.utils.data.Dataset):
+            manifest_sha256, tokens_sha256, bin_tokens = 'a', 'b', ['0', '1', '2']
+            def __len__(self):
+                return 3
+            def __getitem__(self, i):
+                return dict(context={'image': torch.tensor(i)},
+                            target=dict(image=torch.zeros(18, 3, 3, 4), intrinsics=torch.zeros(18, 3, 3),
+                                        extrinsics=torch.zeros(18, 4, 4),
+                                        rel_depth=torch.ones_like(depth) if i == 1 else depth),
+                            meta=dict(bin_token=str(i), scene_id='fixture'))
+        class Model(TinyModel):
+            def __init__(self):
+                super().__init__()
+                self.gaussian_head.rope = nn.Identity()
+                self.calls = []
+            def reconstruct(self, context, stage=3):
+                index = context['image'].item()
+                self.calls.append(index)
+                if index == 0:
+                    raise FloatingPointError('fixture geometry failure')
+                return {'gaussians': torch.zeros(1, 14)}
+            def render(self, gaussians, cameras, shape):
+                return dict(image=torch.zeros(18, 3, 3, 4), depth=depth[:, None])
+        model = Model()
+        identity = dict(path='fixture', sha256='sha', global_step=50)
+        metrics = lambda a, b: {k: torch.ones(18) for k in ('psnr', 'ssim', 'lpips')}
+        with tempfile.TemporaryDirectory() as d, ExitStack() as stack:
+            stack.enter_context(patch.object(module, 'OmniSceneDataset', return_value=Data()))
+            stack.enter_context(patch.object(module, 'sha256_file', return_value='weight_sha'))
+            stack.enter_context(patch.object(module, 'local_path', return_value=Path(d)))
+            stack.enter_context(patch.object(torch.cuda, 'synchronize', lambda *a: None))
+            stack.enter_context(patch.object(torch.cuda, 'get_device_name', return_value='CPU fixture'))
+            result = module.evaluate(model, cfg, d, identity, metrics=metrics)
+            self.assertTrue(result['complete'])
+            self.assertFalse(result['metrics_finite'])
+            self.assertEqual(result['all_18']['num_records'], 3)
+            self.assertEqual(result['all_18']['finite_metric_counts'], dict(psnr=2, ssim=2, lpips=2, pcc=1))
+            self.assertEqual(result['timing']['reconstruction_ms_num_bins'], 2)
+            self.assertEqual(result['numerical_failures'][0]['bin_token'], '0')
+            self.assertEqual(model.calls, [0, 1, 1, 1, 2])
+            with patch.object(model, 'reconstruct', side_effect=AssertionError('must reuse recorded evaluation')):
+                self.assertEqual(module.evaluate(model, cfg, d, identity), result)
+
+    def test_validation_continues_after_unavailable_losses(self):
+        from omniscene import evaluate as module
+        cfg = load_config('configs/experiment/omniscene_112x200.yaml')
+        cfg.Dataset.num_workers = 0
+        class Data(torch.utils.data.Dataset):
+            def __len__(self):
+                return 4
+            def __getitem__(self, i):
+                return dict(context={'image': torch.tensor(i)}, target={}, supervision={}, meta={'bin_token': str(i)})
+        class Model(TinyModel):
+            def forward(self, context, stage, supervision):
+                index = context['image'].item()
+                if index == 0:
+                    return dict(alignment=(None, None, torch.zeros(1, 6, dtype=torch.bool)))
+                if index == 3:
+                    raise FloatingPointError('fixture model failure')
+                return dict(loss=torch.tensor(float('nan') if index == 1 else 2.))
+        with patch.object(module, 'OmniSceneDataset', return_value=Data()):
+            result = module.validate(Model(), cfg, lambda m, r, t, s: {'rec': r['loss']})
+        self.assertEqual(result['num_bins'], 4)
+        self.assertEqual(result['used_bins'], 1)
+        self.assertEqual(result['losses'], {'rec': 2.})
+        self.assertEqual([r['bin_token'] for r in result['skipped_bins']], ['0', '1', '3'])
+
     def test_only_complete_matching_artifacts_are_reused(self):
         from omniscene import evaluate as module
         cfg = load_config('configs/experiment/omniscene_112x200.yaml')

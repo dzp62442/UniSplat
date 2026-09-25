@@ -193,7 +193,7 @@ CUDA_VISIBLE_DEVICES=0 python eval_omniscene.py \
   --split total
 ```
 
-将 `--split total` 改为 `--split mini` 可单独评估 2,048 个 bin。默认结果目录为 `outputs/<实验名>/step_<步数>_<checkpoint哈希前缀>/<split>/`，也可用 `--output-dir /独立结果目录` 指定。结果包括 `all_18`／`novel_12`（另附 `input_6`）的 PSNR、SSIM、LPIPS、PCC，以及模型参数量、完整重建耗时和逐 bin 记录；检查 `evaluation_summary.json` 中的 `complete` 确认评估完整。
+将 `--split total` 改为 `--split mini` 可单独评估 2,048 个 bin。默认结果目录为 `outputs/<实验名>/step_<步数>_<checkpoint哈希前缀>/<split>/`，也可用 `--output-dir /独立结果目录` 指定。结果包括 `all_18`／`novel_12`（另附 `input_6`）的 PSNR、SSIM、LPIPS、PCC，以及模型参数量、完整重建耗时和逐 bin 记录；`evaluation_summary.json` 中的 `complete` 表示清单条目记录齐全，`metrics_finite` 表示指标全部有限，两者需分别查看。
 
 ## Citation
 Please consider citing our work as follows if it is helpful.
@@ -211,4 +211,3 @@ Please consider citing our work as follows if it is helpful.
 ## Acknowledgements
 
 UniSplat uses code from a few open source repositories. Without the efforts of these folks (and their willingness to release their implementations), UniSplat would not be possible. Thanks to these great repositories: [VGGT](https://github.com/facebookresearch/vggt), [MoGe](https://github.com/microsoft/MoGe), [Dino](https://github.com/facebookresearch/dinov2), [Pi3](https://github.com/yyfz/Pi3), [Feature 3DGS](https://github.com/ShijieZhou-UCLA/feature-3dgs), [Omni-Scene](https://github.com/WU-CVGL/Omni-Scene).
-
