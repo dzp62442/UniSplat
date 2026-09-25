@@ -1,0 +1,8 @@
+includes:
+  - configs/dataset/omniscene.yaml
+  - configs/model/unisplat_static.yaml
+  - configs/train/unisplat_three_stage.yaml
+Experiment:
+  name: unisplat_omniscene_static_224x400
+Dataset:
+  image_shape: [224, 400]

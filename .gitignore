@@ -1,5 +1,6 @@
 .hydra/
 output/
+outputs/
 ckpt/
 dependency/
 # Byte-compiled / optimized / DLL files

@@ -38,22 +38,22 @@ class LossDepthTV(nn.Module):
 
 class LPIPS(nn.Module):
     # Learned perceptual metric
-    def __init__(self, use_dropout=True):
+    def __init__(self, use_dropout=True, vgg_ckpt=None, lpips_ckpt=None):
         super().__init__()
         self.scaling_layer = ScalingLayer()
         self.chns = [64, 128, 256, 512, 512]  # vg16 features
-        self.net = vgg16(pretrained=True, requires_grad=False)
+        self.net = vgg16(pretrained=True, requires_grad=False, checkpoint=vgg_ckpt)
         self.lin0 = NetLinLayer(self.chns[0], use_dropout=use_dropout)
         self.lin1 = NetLinLayer(self.chns[1], use_dropout=use_dropout)
         self.lin2 = NetLinLayer(self.chns[2], use_dropout=use_dropout)
         self.lin3 = NetLinLayer(self.chns[3], use_dropout=use_dropout)
         self.lin4 = NetLinLayer(self.chns[4], use_dropout=use_dropout)
-        self.load_from_pretrained()
+        self.load_from_pretrained(checkpoint=lpips_ckpt)
         for param in self.parameters():
             param.requires_grad = False
 
-    def load_from_pretrained(self, name="vgg_lpips"):
-        ckpt = get_ckpt_path(name, "taming/modules/autoencoder/lpips")
+    def load_from_pretrained(self, name="vgg_lpips", checkpoint=None):
+        ckpt = checkpoint if checkpoint is not None else get_ckpt_path(name, "taming/modules/autoencoder/lpips")
         #ckpt = ".cache/vgg.pth"
         self.load_state_dict(torch.load(ckpt, map_location=torch.device("cpu")), strict=False)
         print("loaded pretrained LPIPS loss from {}".format(ckpt))
@@ -103,9 +103,14 @@ class NetLinLayer(nn.Module):
 
 
 class vgg16(torch.nn.Module):
-    def __init__(self, requires_grad=False, pretrained=True):
+    def __init__(self, requires_grad=False, pretrained=True, checkpoint=None):
         super(vgg16, self).__init__()
-        vgg_pretrained_features = models.vgg16(pretrained=pretrained).features
+        if checkpoint is None:
+            vgg_pretrained_features = models.vgg16(pretrained=pretrained).features
+        else:
+            backbone = models.vgg16(weights=None)
+            backbone.load_state_dict(torch.load(checkpoint, map_location='cpu', weights_only=True), strict=True)
+            vgg_pretrained_features = backbone.features
         self.slice1 = torch.nn.Sequential()
         self.slice2 = torch.nn.Sequential()
         self.slice3 = torch.nn.Sequential()

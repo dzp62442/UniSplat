@@ -1,0 +1,49 @@
+Experiment:
+  seed: 42
+  work_dir_root: work_dirs
+Train:
+  max_steps: 100001
+  stage_steps: [44445, 33334, 22222]
+  gradient_accumulation_steps: 1
+  val_every_steps: 1000
+  mini_test_every_n_val: 10
+  mini_test_stages: [2, 3]
+  final_mini_test: true
+  grad_max_norm: 10.0
+  log_every_steps: 20
+  max_consecutive_skipped_updates: 10
+Optimizer:
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.01
+  stages:
+    - {head_lr: 1.0e-4, image_backbone_lr: null}
+    - {head_lr: 1.5e-4, image_backbone_lr: 1.5e-5}
+    - {head_lr: 5.0e-5, image_backbone_lr: 1.5e-5}
+Scheduler:
+  pct_start: 0.01
+  anneal_strategy: cos
+  div_factor: 25.0
+  final_div_factor: 10000.0
+  three_phase: false
+  cycle_momentum: true
+  base_momentum: 0.85
+  max_momentum: 0.95
+Evaluation:
+  split: mini
+  view_groups: [all_18, novel_12, input_6]
+  metrics: [psnr, ssim, lpips, pcc]
+  pcc_reference: depth_anything_v2
+  depth_semantics: accumulated_z
+  pixel_protocol: full_image
+  warmup_steps: 5
+  save_images: false
+Logging:
+  backend: local
+  wandb_mode: offline
+Feishu:
+  enabled: true
+  module_root: /home/dzp62442/Libraries
+  timeout_seconds: 15
+  max_attempts: 3
+  events: [train_start, mini_test_complete]

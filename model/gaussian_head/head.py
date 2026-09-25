@@ -14,7 +14,6 @@ from .utils import create_uv_grid, position_grid_to_embed, is_point_in_frustum_b
     align_points_scale_z_shift, mask_aware_nearest_resize, normalize_intrinsics
 from .unet import UNet
 from .head_layers import _make_scratch, _make_fusion_block_custom, custom_interpolate
-from simple_knn_v2._C import distCUDACross
 from pi3.models.layers.transformer_head import TransformerDecoder
 from pi3.models.layers.pos_embed import RoPE2D, PositionGetter
 
@@ -78,7 +77,7 @@ class GuassianHead(nn.Module):
         self.cfg = cfg
 
         # loss
-        self.perceptual_loss = LPIPS().eval()
+        self.perceptual_loss = LPIPS().eval() if cfg.get('build_perceptual_loss', True) else nn.Identity()
         self.loss_weight = cfg.get('Loss_weight', None)
         self.l1_loss_mask = cfg.get('l1_loss_mask', None)
         self.p_loss_mask = cfg.get('p_loss_mask', None)
@@ -93,7 +92,7 @@ class GuassianHead(nn.Module):
         
         # UNet for Scaffold feature extraction
         self.unet = UNet(self.grid_size.numpy(), self.voxel_size.numpy(), self.pts_range.numpy(), cfg.voxel_gs_num)
-        self.image_backbone = vit_small(img_size=render_w, patch_size=14, num_register_tokens=4, \
+        self.image_backbone = vit_small(img_size=cfg.get('dinov2_pretrain_img_size', render_w), patch_size=14, num_register_tokens=4, \
             interpolate_antialias=True, interpolate_offset=0.0, block_chunks=0, init_values=1.0)
         self._resnet_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32)
         self._resnet_mean = self._resnet_mean[None, None, :, None, None]
@@ -926,6 +925,7 @@ class GuassianHead(nn.Module):
         return out
     
     def refine_guassians(self, voxel_features, voxel_coords, means, sky_mask, img_features):
+        from simple_knn_v2._C import distCUDACross
         
         means_in = means - self.pts_range[None, :3]
         means_in = torch.floor(means_in / (self.voxel_size[None, :3] * 2)).int()
@@ -1072,4 +1072,3 @@ class Gaussians_Queue_v2(nn.Module):
                             getattr(self, field)[i] = data[mask][:, 1:]
                         else:
                             getattr(self, field)[i] = data[mask]
-

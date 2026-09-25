@@ -46,7 +46,7 @@ python demo.py --load_from /path/to/checkpoint.pth --data_path /path/to/demo_dat
 
 The script will process the input data and save the rendered images along with dynamic masks to the output directory.
 
-## Data Preparation
+## Data Preparation (Waymo)
 
 Training and full-scene evaluation use the Waymo Open Perception dataset
 (v1.4.3). We keep Waymo's `training/` and `validation/` split: run
@@ -117,7 +117,7 @@ python tools/run_sky_mask.py \
 Writes `{frame:05d}_{cam}_moge_mask.png` next to the `.exr`/`.npz` files
 under each scene.
 
-## Training
+## Training (Waymo)
 
 Training is done in three stages, each driven by its own config under
 `configs/`. The full chain is:
@@ -159,6 +159,42 @@ Checkpoints land in `./work_dirs/{config_stem}/model_epoch_{N}/`. Resuming
 is automatic: the script picks up the latest `model_epoch_*` it finds in
 the work dir.
 
+## OmniScene 静态六视角实验（comp_svfgs）
+
+本分支支持使用 OmniScene 格式的 nuScenes 数据进行单帧六路 RGB 重建，提供 **112×200** 和 **224×400** 两个独立实验（H×W）。保留 UniSplat 默认模型结构和三阶段训练，使用 Metric3D 深度监督尺度对齐，按 SVF-GS 的方式使用动态掩码；关闭时序记忆、天空专用分支和动态 BCE。该设置属于静态对比适配，不能直接视为论文原始 nuScenes 实验的复现。完整配置、数据协议及验证记录见 [OmniScene 数据集实验文档](<docs/OmniScene 数据集实验文档.md>)。
+
+### 启动训练
+
+使用单 GPU 入口；三阶段由程序自动衔接。首次启动从基础权重训练，之后执行相同命令会自动断点续训。在同一张 GPU 上分别运行以下命令：
+
+```bash
+# 112×200
+CUDA_VISIBLE_DEVICES=0 python train_omniscene.py --config configs/experiment/omniscene_112x200.yaml
+
+# 224×400
+CUDA_VISIBLE_DEVICES=0 python train_omniscene.py --config configs/experiment/omniscene_224x400.yaml
+```
+
+训练／验证／测试 batch size 均为 1，每个实验共 **100,001 次优化器更新**，三阶段分别为 44,445／33,334／22,222 步。每 1,000 步在 10 个 bin 上验证；mini 测试在第 50,000、60,000、70,000、80,000、90,000、100,000 步，以及最终 **100,001 步**执行，每次评估 2,048 个 bin。
+
+### 独立评估
+
+训练结束自动执行 mini 测试；正式对比使用以下 `--split total` 命令评估完整 **30,080 个 bin**。两种分辨率必须使用各自的配置和 checkpoint。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python eval_omniscene.py \
+  --config configs/experiment/omniscene_112x200.yaml \
+  --checkpoint work_dirs/unisplat_omniscene_static_112x200/checkpoints/step_100001 \
+  --split total
+
+CUDA_VISIBLE_DEVICES=0 python eval_omniscene.py \
+  --config configs/experiment/omniscene_224x400.yaml \
+  --checkpoint work_dirs/unisplat_omniscene_static_224x400/checkpoints/step_100001 \
+  --split total
+```
+
+将 `--split total` 改为 `--split mini` 可单独评估 2,048 个 bin。默认结果目录为 `outputs/<实验名>/step_<步数>_<checkpoint哈希前缀>/<split>/`，也可用 `--output-dir /独立结果目录` 指定。结果包括 `all_18`／`novel_12`（另附 `input_6`）的 PSNR、SSIM、LPIPS、PCC，以及模型参数量、完整重建耗时和逐 bin 记录；检查 `evaluation_summary.json` 中的 `complete` 确认评估完整。
+
 ## Citation
 Please consider citing our work as follows if it is helpful.
 ```
@@ -175,5 +211,4 @@ Please consider citing our work as follows if it is helpful.
 ## Acknowledgements
 
 UniSplat uses code from a few open source repositories. Without the efforts of these folks (and their willingness to release their implementations), UniSplat would not be possible. Thanks to these great repositories: [VGGT](https://github.com/facebookresearch/vggt), [MoGe](https://github.com/microsoft/MoGe), [Dino](https://github.com/facebookresearch/dinov2), [Pi3](https://github.com/yyfz/Pi3), [Feature 3DGS](https://github.com/ShijieZhou-UCLA/feature-3dgs), [Omni-Scene](https://github.com/WU-CVGL/Omni-Scene).
-
 

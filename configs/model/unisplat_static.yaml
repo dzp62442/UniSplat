@@ -1,0 +1,32 @@
+Model:
+  pi3_decoder_size: large
+  pi3_ckpt: ckpt/pi3/model.safetensors
+  dinov2_ckpt: ckpt/dinov2/dinov2_vits14_reg4_pretrain.pth
+  temporal_enabled: false
+  use_sky_branch: false
+  padding: right_replicate_to_14
+  pi3_precision: bf16
+  checkpoint_rendering: true
+  Gaussian_head:
+    dinov2_pretrain_img_size: 518  # Official reg4 weights have a 37x37 positional grid.
+    build_perceptual_loss: false
+    depth_max_m: 400.0
+    offset_scale: 2.0
+    max_scale: 0.1
+    max_scale_voxel: 0.2
+    pts_range: [-72.0, -72.0, -4.0, 72.0, 72.0, 12.0]
+    voxel_size: [0.1, 0.1, 0.2]
+    voxel_gs_num: 2
+Loss:
+  scale_weight: 0.1
+  shift_weight: 1.0
+  rec_weight: 5.0
+  rec_view_weight: 1.875
+  perceptual_weight: 0.05
+  perceptual_view_weight: 0.625
+  aux_voxel_weight: 0.25
+  dyn_loss_weight: 0.0
+  vgg_ckpt: ckpt/lpips/vgg16-397923af.pth
+  lpips_ckpt: ckpt/lpips/vgg.pth
+  perceptual_chunk_size: 1
+  checkpoint_perceptual: true

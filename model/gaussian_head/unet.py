@@ -109,7 +109,7 @@ class UNet(nn.Module):
         x = replace_feature(x, features.view(n, out_channels, -1).sum(dim=2))
         return x
 
-    def forward(self, voxel_features, voxel_coords, batch_size, history_infos):
+    def forward(self, voxel_features, voxel_coords, batch_size, history_infos=None):
         input_sp_tensor = spconv.SparseConvTensor(
             features=voxel_features,
             indices=voxel_coords.int(),
@@ -134,18 +134,18 @@ class UNet(nn.Module):
         x_up3_time = x_up3.features + self.time_embedding.weight[1][None, :] + self.pos_embedding(x_up3_centers)
         x_up3 = replace_feature(x_up3, x_up3_time)
     
-        history_voxel_features, history_voxel_coords, history_voxel_pos, history_masks = history_infos
-        history_voxel_features = history_voxel_features + self.time_embedding.weight[0][None, :]
-        history_voxel_features = history_voxel_features + self.pos_embedding(history_voxel_pos)
-        history_voxel_features = history_voxel_features * history_masks[:, None]
-        history_sp_tensor = spconv.SparseConvTensor(
-            features=history_voxel_features,
-            indices=history_voxel_coords.int(),
-            spatial_shape=x_up3.spatial_shape,
-            batch_size=batch_size
-        )
-        # history current fusion
-        x_up3 = Fsp.sparse_add(x_up3, history_sp_tensor)
+        if history_infos is not None:
+            history_voxel_features, history_voxel_coords, history_voxel_pos, history_masks = history_infos
+            history_voxel_features = history_voxel_features + self.time_embedding.weight[0][None, :]
+            history_voxel_features = history_voxel_features + self.pos_embedding(history_voxel_pos)
+            history_voxel_features = history_voxel_features * history_masks[:, None]
+            history_sp_tensor = spconv.SparseConvTensor(
+                features=history_voxel_features,
+                indices=history_voxel_coords.int(),
+                spatial_shape=x_up3.spatial_shape,
+                batch_size=batch_size
+            )
+            x_up3 = Fsp.sparse_add(x_up3, history_sp_tensor)
         x_up3 = self.fusion(x_up3)
         
         save_features = x_up3.features
@@ -164,4 +164,4 @@ class UNet(nn.Module):
         )
         gaussians = self.to_gaussians(gs_features)
         point_coords = torch.cat((x_up3.indices[:, 0:1].float(), point_coords), dim=1)
-        return gaussians, point_coords, save_features, save_coords 
+        return gaussians, point_coords, save_features, save_coords
