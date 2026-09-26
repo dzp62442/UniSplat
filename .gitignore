@@ -2,6 +2,7 @@
 output/
 outputs/
 ckpt/
+ckpt
 dependency/
 # Byte-compiled / optimized / DLL files
 __pycache__/
